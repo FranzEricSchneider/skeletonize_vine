@@ -1,14 +1,28 @@
+from collections import Counter, namedtuple
+import json
+import matplotlib
+from matplotlib import pyplot
 import networkx
 import numpy
+import open3d
+from os import remove
 from scipy import sparse
 from scipy.optimize import minimize
 from scipy.sparse import csgraph
 from scipy.spatial import KDTree
 
+from .cloud_utils import (
+    ht_from_points,
+    load_clouds,
+    object_from_pts,
+    smoothing,
+    sort_for_vis,
+)
+
 
 class Line:
     def __init__(
-        self, graph, points, indices, topo_edge, original_indices, subsample=1
+        self, graph, points, indices, topo_edge, original_indices, subsample=2, subsample_cutoff=15
     ):
         """
         TODO
@@ -19,13 +33,14 @@ class Line:
             indices: TODO
             topo_edge: TODO
             original_indices: TODO
-            subsample: TODO
+            subsample: How much to subsample points for the minimization step
+            subsample_cutoff: Below this number of points, don't subsample
         """
 
         chosen = numpy.array(graph.nodes)[indices]
         self.full_points = points[chosen]
         self.original_indices_used = original_indices[chosen]
-        if len(indices) < SUBSAMPLE_CUTOFF:
+        if len(indices) < subsample_cutoff:
             self.points = self.full_points.copy()
         else:
             self.points = self.full_points[
@@ -165,12 +180,19 @@ class LineGraph:
 
 def array_to_points(array):
     """
-    TODO
+    Converts a known array format into a set of endpoints and radii. Note that
+    the endpoints can be shared between multiple lines if there is a shared
+    junction.
+    [paired with lines_to_array, opposite action]
 
     Arguments:
-        array: TODO
+        array: (N, 8) array where each row represents a line in space (endpoint,
+            endpoint, and radius)
 
-    Returns: TODO
+    Returns: Tuple
+        [0] (N, 3) array containing the first set of endpoints
+        [1] (N, 3) array containing the corresponding set of endpoints
+        [2] (N,) array of line radii
     """
 
     ends1 = array[:, 0:3]
@@ -181,12 +203,19 @@ def array_to_points(array):
 
 def lines_to_array(line_collection):
     """
-    TODO
+    Takes a list of Line objects and extracts the endpoints and the indices of
+    the points in the point cloud corresponding to each line.
+    [paired with array_to_points, opposite action]
 
     Arguments:
-        line_collection: TODO
+        line_collection: list of Line() objects
 
-    Returns: TODO
+    Returns: Tuple
+        [0] (N, 8) array, one row per line, with (endpoint, endpoint, radius,
+            radius). For now the radii are equal but we could do a radius per
+            junction instead of per line later.
+        [1] list of lists, where each internal list is the indices of points
+            that go with the corresponding line row in the array
     """
 
     array = [
@@ -254,12 +283,17 @@ def build_lines(split_graphs, topo_graph, points, cluster_ind):
     Then return a list of all lines for the entire cluster/topo graph
 
     Arguments:
-        split_graphs: TODO
-        topo_graph: TODO
-        points: TODO
-        cluster_ind: TODO
+        split_graphs: dictionary where keys are indices in the topo graph (int)
+            and values are LineGraph objects
+        topo_graph: networkx.MultiDiGraph where each edge is an unbranching
+            section of the vine
+        points: (N, 3) array of 3D points for the chosen cluster
+        cluster_ind: (N,) array indicating which id in the topo graph each
+            point is associated to
 
-    Returns: TODO
+    Returns: list of lists, where each internal list contains Line items. The
+        basic idea is that each unbranching line in the topo graph is
+        represented by Line segments
     """
 
     line_collection = []
@@ -275,10 +309,6 @@ def build_lines(split_graphs, topo_graph, points, cluster_ind):
         # know which points belong to them in the graph
         lines = []
         for j, (i1, i2) in enumerate(zip(indices[:-1], indices[1:])):
-            if len(split_graphs[chain_idx].sorted_order[i1:i2]) == 0:
-                import ipdb
-
-                ipdb.set_trace()
             lines.append(
                 Line(
                     graph=split_graphs[chain_idx].graph,
@@ -291,7 +321,6 @@ def build_lines(split_graphs, topo_graph, points, cluster_ind):
                     # Do some bookkeeping and track which of the original points
                     # are used with this line
                     original_indices=cluster_ind,
-                    subsample=SUBSAMPLE,
                 )
             )
             # Do some bookkeeping to track which indices correspond to the line
@@ -373,23 +402,29 @@ def calc_linegraph_meta(graph, points, ends, line_seg_len):
     )
 
 
-def calculate_mst(graph, dist_graph, save_dir, points, viz_dir):
+def calculate_mst(graph, dist_graph, save_dir, points, viz_dir, vis_mst_mesh=False):
     """
-    TODO
+    Perform MST operation on an arbitrary graph, possibly visualize, but then
+    replace the graphs values with those in dist_graph.
 
     Arguments:
-        graph: TODO
-        dist_graph: TODO
-        save_dir: TODO
-        points: TODO
-        viz_dir: TODO
+        graph: scipy.sparse.csr_matrix graph to calculate an MST for
+        dist_graph: scipy.sparse.csr_matrix graph of the same structure, but
+            where the values are the distances between nodes
+        save_dir: pathlib.Path directory where the mst is saved for future
+            reference or debugging
+        points: (N, 3) array of points that correspond to graph for visualizing
+            the MST
+        viz_dir: pathlib.Path directory to save visualized graph if relevant
+        vis_mst_mesh: (boolean) whether to visualize MST as a mesh (very slow)
 
-    Returns: TODO
+    Returns: scipy.sparse.csr_matrix graph, minimum spanning tree of the
+        original but with the values set as distances
     """
 
     mst = sparse.csgraph.minimum_spanning_tree(graph)
     sparse.save_npz(save_dir.joinpath("mst.npz"), mst)
-    if VIS_MST_MESH:
+    if vis_mst_mesh:
         # This visualizes the whole MST and can take a while
         visualize_as_mesh(points, mst, viz_dir)
 
@@ -469,7 +504,7 @@ def chain_subgraph(full, reduced_smooth, topo, span):
 
         # IF span[1] is a junction, then remove its descendants. However if span[1]
         # is just partway out to a leaf, then we should leave its descendants
-        # alone. This is necessary (critical) because of how BARB_THRESH clips bits
+        # alone. This is necessary (critical) because of how barb_thresh clips bits
         # off of branches as described in remove_barbs. span[1] will therefore be
         # partly along the subgraph to a true leaf, and we want to collect those
         # points.
@@ -528,7 +563,16 @@ def choose_a_root(mst, points):
     return root_i, dist_from_root
 
 
-def close_mst_cycles(close_cycles, mst, graph, points, save_dir, viz_dir):
+def close_mst_cycles(
+    close_cycles,
+    mst,
+    graph,
+    points,
+    save_dir,
+    viz_dir,
+    vis_mst_mesh=False,
+    min_loop_size=0.22,
+):
     """
     TODO
 
@@ -539,6 +583,7 @@ def close_mst_cycles(close_cycles, mst, graph, points, save_dir, viz_dir):
         points: TODO
         save_dir: TODO
         viz_dir: TODO
+        min_loop_size: The size of a loop (m) above which we will add it intentionally as a cycle
 
     Returns: TODO
     """
@@ -569,7 +614,7 @@ def close_mst_cycles(close_cycles, mst, graph, points, save_dir, viz_dir):
             loop_dist = sparse.csgraph.dijkstra(cyclic, directed=False, indices=leaf)[
                 nleaf
             ]
-            if loop_dist < MIN_LOOP_SIZE:
+            if loop_dist < min_loop_size:
                 continue
             cyclic[leaf, nleaf] = min(ndists)
             cyclic[nleaf, leaf] = min(ndists)
@@ -579,7 +624,7 @@ def close_mst_cycles(close_cycles, mst, graph, points, save_dir, viz_dir):
 
     sparse.save_npz(save_dir.joinpath("cyclic_mst.npz"), cyclic)
 
-    if VIS_MST_MESH:
+    if vis_mst_mesh:
         # This visualizes the whole MST and can take a while
         visualize_as_mesh(points, cyclic, viz_dir, name="cyclic_mst.ply")
 
@@ -648,14 +693,17 @@ def construct_graph(
         use_density: TODO
         final_voxel_size: TODO
 
-    Returns: TODO
+    Returns: Tuple
+        [0]
+        [1] scipy.sparse.csr_matrix for the locally connected graph
+        [2]
     """
 
     cloud = load_clouds(cloud_paths)
     original_cloud = open3d.geometry.PointCloud(cloud)
     for name, kwargs in filtering:
-        if name == "laplacian_smoothing":
-            output = laplacian_smoothing(cloud, **kwargs)
+        if name == "smoothing":
+            output = smoothing(cloud, **kwargs)
         else:
             output = getattr(cloud, name)(**kwargs)
         if name in ("remove_radius_outlier", "remove_statistical_outlier"):
@@ -928,7 +976,7 @@ def objective_function(x, lines):
     return cost1
 
 
-def optimize_line_ends(topo, root, full_collection, viz_dir, line_label):
+def optimize_line_ends(topo, root, full_collection, viz_dir, line_label, verbose=False):
     """
     TODO
 
@@ -938,6 +986,7 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label):
         full_collection: TODO
         viz_dir: TODO
         line_label: TODO
+        verbose: Add debug printouts
 
     Returns: TODO
     """
@@ -945,7 +994,7 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label):
     count = 0
     for line_collection in subdivide_graph(topo, root, full_collection):
         count += len(line_collection)
-        if VERBOSE:
+        if verbose:
             print(f"On lines {count} / {len(full_collection)}")
 
         # Create the initial state AND the layout of which state corresponds to
@@ -966,7 +1015,7 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label):
         ] * (len(x0) // 3)
 
         # Then run minimization
-        if VERBOSE:
+        if verbose:
             start = time.time()
         lines = sum(line_collection, start=[])
 
@@ -989,7 +1038,7 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label):
         if fail_counter != 0:
             print(f"Failed {fail_counter} attempts")
 
-        if VERBOSE:
+        if verbose:
             end = time.time()
             print(f"Optimization took {end - start} seconds")
 
@@ -1132,7 +1181,7 @@ def order_edges(topo, collection, node, seen=None):
     return ordered
 
 
-def points_to_graph(points, neighbors, use_density):
+def points_to_graph(points, neighbors, use_density, distance_thresh=0.025):
     """
     Fully connect all points within a tunable radius.
 
@@ -1150,7 +1199,7 @@ def points_to_graph(points, neighbors, use_density):
         # TODO: Work out a way to reduce re-calculations where we get the
         # distance for something already populated in the graph. Or is it
         # faster to just not check?
-        indices = tree.query_ball_point(pt1, r=DISTANCE_THRESH)
+        indices = tree.query_ball_point(pt1, r=distance_thresh)
         for j, distance in zip(
             indices, numpy.linalg.norm(points[indices] - pt1, axis=1)
         ):
@@ -1158,7 +1207,7 @@ def points_to_graph(points, neighbors, use_density):
                 continue
             if use_density:
                 avg_ij_neighbors = (neighbors[i] + neighbors[j]) / 2
-                value = (WEIGHT1 * distance) * (WEIGHT2 / avg_ij_neighbors)
+                value = distance / avg_ij_neighbors
             else:
                 value = distance
             graph[i, j] = value
@@ -1168,16 +1217,17 @@ def points_to_graph(points, neighbors, use_density):
     return graph.tocsr(), distance_graph.tocsr()
 
 
-def remove_barbs(graph, loop_indices):
+def remove_barbs(graph, loop_indices, barb_thresh):
     """
     Remove all the little offshoots along a graph that have low downstream
     weights. This unfortunately includes the tips of the main branch as well,
     instead of dealing with that here it is accounted for later. At this point
-    know that the tips of main paths have been clipped back by BARB_THRESH.
+    know that the tips of main paths have been clipped back by barb_thresh.
 
     Arguments:
         graph: TODO
         loop_indices: TODO
+        barb_thresh: TODO
 
     Returns: TODO
     """
@@ -1193,14 +1243,14 @@ def remove_barbs(graph, loop_indices):
             loop_edges.append(edge)
     for edge in loop_edges:
         search.remove_edge(*edge)
-        search.add_edge(*edge, weight=BARB_THRESH + 1e-3)
+        search.add_edge(*edge, weight=barb_thresh + 1e-3)
 
     # Remove nodes with low downstream presences
     bad_nodes = [
         n
         for n in search.nodes
         if (
-            downstream_cost(search, n, cutoff=BARB_THRESH + 0.2) < BARB_THRESH
+            downstream_cost(search, n, cutoff=barb_thresh + 0.2) < barb_thresh
             and n not in loop_indices
         )
     ]
@@ -1212,7 +1262,7 @@ def remove_barbs(graph, loop_indices):
     return smooth
 
 
-def subdivide_graph(topo, root, full_collection):
+def subdivide_graph(topo, root, full_collection, max_optimize_lines=40):
     """
     TODO
 
@@ -1220,12 +1270,13 @@ def subdivide_graph(topo, root, full_collection):
         topo: TODO
         root: TODO
         full_collection: TODO
+        max_optimize_lines: The max number of lines to optimize together
 
     Returns: TODO
     """
 
     num_lines = sum([len(lines) for lines in full_collection])
-    if num_lines <= MAX_OPTIMIZE_LINES:
+    if num_lines <= max_optimize_lines:
         yield full_collection
         return
 
@@ -1251,7 +1302,7 @@ def subdivide_graph(topo, root, full_collection):
             ]
             num_gathered = sum([len(lines) for lines in line_collection])
             num_additional = sum([len(candidate) for candidate in candidates])
-            addition_too_big = num_gathered + num_additional > MAX_OPTIMIZE_LINES
+            addition_too_big = num_gathered + num_additional > max_optimize_lines
             addition_disconnected = (
                 len(edge_collection) > 0 and len(set(topo_edge) - edge_collection) == 2
             )
@@ -1272,13 +1323,11 @@ def subdivide_graph(topo, root, full_collection):
 
 def visualize_graph(graph, save_dir):
     """
-    TODO
+    Make a row/column adjacency visualization for the graph and save it.
 
     Arguments:
-        graph: TODO
-        save_dir: TODO
-
-    Returns: TODO
+        graph: scipy.sparse.csr_matrix representing a structure graph
+        save_dir: pathlib.Path directory
     """
     pyplot.figure(figsize=(8, 8), dpi=200)
     pyplot.spy(graph, markersize=0.1)

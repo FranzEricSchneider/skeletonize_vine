@@ -1,8 +1,37 @@
+from itertools import chain, product
+import json
+import networkx
 import numpy
+
+from .cloud_utils import vis_points
+from .graph_utils import (
+    build_lines,
+    calc_linegraph_meta,
+    chain_subgraph,
+    choose_a_root,
+    get_topography,
+    line_to_points,
+    lines_to_array,
+    mst_to_directed,
+    optimize_line_ends,
+    remove_barbs,
+    visualize_as_mesh,
+)
 
 
 def calculate_line_components(
-    mst, points, labels, label, viz_dir, save_dir, cost_log_dir, parameters, viz=False
+    mst,
+    points,
+    labels,
+    label,
+    viz_dir,
+    save_dir,
+    parameters,
+    viz=False,
+    viz_subgraphs=False,
+    verbose=False,
+    ignorable_length=0.04,
+    barb_thresh=0.04,
 ):
 
     """
@@ -15,9 +44,12 @@ def calculate_line_components(
         label: TODO
         viz_dir: TODO
         save_dir: TODO
-        cost_log_dir: TODO
         parameters: TODO
         viz: TODO
+        viz_subgraphs: TODO
+        verbose: TODO
+        ignorable_length: TODO
+        barb_thresh: Length along MST beneath which we call a branch a barb (m)
 
     Returns: TODO
     """
@@ -26,13 +58,13 @@ def calculate_line_components(
     cluster_mst = mst[cluster_ind, :][:, cluster_ind]
     cluster_points = points[cluster_ind]
 
-    if VERBOSE:
+    if verbose:
         print(f"Processing label {label} with {len(cluster_ind)} nodes")
 
     # Choose an arbitrary root at the edge
     root_i, dist_from_root = choose_a_root(cluster_mst, cluster_points)
     max_distance = dist_from_root.max()
-    if max_distance < IGNORABLE_LENGTH:
+    if max_distance < ignorable_length:
         return
 
     # Convert the undirected graph to a directed graph from our chosen root
@@ -56,7 +88,7 @@ def calculate_line_components(
             )
 
     # Remove barbed wire nodes who have no downstream weight
-    smooth_graph = remove_barbs(directed_graph, loop_indices)
+    smooth_graph = remove_barbs(directed_graph, loop_indices, barb_thresh)
     # If removing barbs leaves an empty graph (probably due to a barb threshold
     # very near the ignorable length) then just ignore this
     if len(smooth_graph.nodes) <= 1:
@@ -72,13 +104,13 @@ def calculate_line_components(
         visualize_as_mesh(
             graph=directed_graph,
             name=f"label{label}_1_PREdirected_cluster.ply",
-            shape=VIS_SHAPE,
+            shape="arrow",
             **vizkwargs,
         )
         visualize_as_mesh(
             graph=smooth_graph,
             name=f"label{label}_2_PREsmoothed.ply",
-            shape=VIS_SHAPE,
+            shape="arrow",
             **vizkwargs,
         )
 
@@ -97,19 +129,19 @@ def calculate_line_components(
         visualize_as_mesh(
             graph=directed_graph,
             name=f"label{label}_1_directed_cluster.ply",
-            shape=VIS_SHAPE,
+            shape="arrow",
             **vizkwargs,
         )
         visualize_as_mesh(
             graph=smooth_graph,
             name=f"label{label}_2_smoothed.ply",
-            shape=VIS_SHAPE,
+            shape="arrow",
             **vizkwargs,
         )
         visualize_as_mesh(
             graph=topo_graph,
             name=f"label{label}_3_topography.ply",
-            shape=VIS_SHAPE,
+            shape="arrow",
             **vizkwargs,
         )
     topos = len([_ for _ in networkx.connected_components(topo_graph.to_undirected())])
@@ -127,9 +159,9 @@ def calculate_line_components(
             topo=topo_graph,
             span=topo_chain,
         )
-        if viz and VIS_SUBGRAPHS:
+        if viz and viz_subgraphs:
             name = f"label{label}_4_{'-'.join(map(str, topo_chain))}_subgraphs.ply"
-            visualize_as_mesh(graph=line_graph, name=name, shape=VIS_SHAPE, **vizkwargs)
+            visualize_as_mesh(graph=line_graph, name=name, shape="arrow", **vizkwargs)
 
         # This does a couple of things, but basically it decides how the points
         # in this line graph are ordered, and gives an (initial) split along
@@ -154,9 +186,8 @@ def calculate_line_components(
         root=root_i,
         full_collection=line_collection,
         viz_dir=viz_dir,
-        weights=get_cost_params(parameters),
         line_label=label,
-        cost_log_dir=cost_log_dir,
+        verbose=verbose,
     )
 
     estimate_line_radii(

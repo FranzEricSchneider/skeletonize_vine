@@ -1,5 +1,6 @@
 import numpy
 import open3d
+from scipy.spatial import KDTree
 
 
 def ht_from_points(p1, p2, offset=0.0):
@@ -121,9 +122,11 @@ def smoothing(cloud, radius=0.01):
     """
     points = numpy.asarray(cloud.points)
     kdtree = open3d.geometry.KDTreeFlann(cloud)
+    from tqdm import tqdm
 
-    filtered_points = []
-    for point in points:
+    filtered = []
+    colors = []
+    for point in tqdm(points):
         _, idx, _ = kdtree.search_knn_vector_3d(point, knn=20)
         in_radius = points[idx, :]
 
@@ -135,13 +138,15 @@ def smoothing(cloud, radius=0.01):
             point,
             radius=0.001 + radius * numpy.sqrt(singular_values[1] / singular_values[0]),
         )
-        in_radius = points[idx, :]
-        filtered_points.append(numpy.mean(in_radius, axis=0))
+        filtered.append(numpy.mean(points[idx, :], axis=0))
+        if len(cloud.colors) > 0:
+            colors.append(numpy.mean(numpy.asarray(cloud.colors)[idx, :], axis=0))
 
-    filtered_points = numpy.unique(filtered_points, axis=0)
-    return open3d.geometry.PointCloud(
-        open3d.utility.Vector3dVector(numpy.array(filtered_points))
-    )
+    new_cloud = open3d.geometry.PointCloud()
+    new_cloud.points = open3d.utility.Vector3dVector(numpy.array(filtered))
+    if len(colors) > 0:
+        new_cloud.colors = open3d.utility.Vector3dVector(numpy.array(colors))
+    return new_cloud
 
 
 def sort_for_vis(cloud):
