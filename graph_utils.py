@@ -274,7 +274,7 @@ def build_initial_state(line_collection):
     return numpy.array(x0)
 
 
-def build_lines(split_graphs, topo_graph, points, cluster_ind):
+def build_lines(split_graphs, topo, points, cluster_ind):
     """
     Go through and do the mostly rote process of
         1) Take given indices and sorted order
@@ -285,8 +285,9 @@ def build_lines(split_graphs, topo_graph, points, cluster_ind):
     Arguments:
         split_graphs: dictionary where keys are indices in the topo graph (int)
             and values are LineGraph objects
-        topo_graph: networkx.MultiDiGraph where each edge is an unbranching
-            section of the vine
+        topo: (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
         points: (N, 3) array of 3D points for the chosen cluster
         cluster_ind: (N,) array indicating which id in the topo graph each
             point is associated to
@@ -297,7 +298,7 @@ def build_lines(split_graphs, topo_graph, points, cluster_ind):
     """
 
     line_collection = []
-    for chain_idx, topo_chain in enumerate(topo_graph.edges):
+    for chain_idx, topo_chain in enumerate(topo.edges):
 
         if chain_idx not in split_graphs:
             continue
@@ -448,12 +449,21 @@ def chain_subgraph(full, reduced_smooth, topo, span):
     full graph that is contained "within" these spanning nodes.
 
     Arguments:
-        full: TODO
-        reduced_smooth: TODO
-        topo: TODO
-        span: TODO
+        full: (networkx.DiGraph) full graph between points that we are
+            processing
+        reduced_smooth: (networkx.DiGraph) subset of the full graph where barbs
+            have been removed
+        topo: (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
+        span: 3-element tuple of integers, the first two of which contain the
+            two node endpoints we care about
 
-    Returns: TODO
+    Returns: Tuple
+        [0] (networkx.DiGraph) a subset of the full graph between the spanning
+            endpoints
+        [1] (networkx.DiGraph) a subset of the given smooth graph, where all
+            lines present in [0] have been removed from the smooth graph
     """
 
     # In the SMOOTH graph (no junctions in the span) check how many successors
@@ -527,13 +537,20 @@ def chain_subgraph(full, reduced_smooth, topo, span):
 
 def choose_a_root(mst, points):
     """
-    TODO
+    Pick an arbitrary root from the points in the graph, ideally something
+    along the edge.
+
+    For small graphs, we pick a leaf point that is the farthest from the most
+    distant leaf. For memory reasons, for big graphs we pick the leaf farthest
+    spatially from the center of the points.
 
     Arguments:
-        mst: TODO
-        points: TODO
+        mst: (scipy.sparse.csr_matrix) undirected graph among the points
+        points: (N, 3) 3D points that the MST connects in a graph
 
-    Returns: TODO
+    Returns: Tuple
+        [0] (int) index of the root node
+        [1] (N,) distance of each point from the root, tracing the graph paths
     """
 
     # TODO: Refine this cutoff over time with experience
@@ -574,18 +591,23 @@ def close_mst_cycles(
     min_loop_size=0.22,
 ):
     """
-    TODO
+    Finding leaves of the MST graph where a single step in the locally
+    connected graph connects to another leaf, then adding that edge back
 
     Arguments:
-        close_cycles: TODO
-        mst: TODO
-        graph: TODO
-        points: TODO
-        save_dir: TODO
-        viz_dir: TODO
-        min_loop_size: The size of a loop (m) above which we will add it intentionally as a cycle
+        close_cycles: (boolean) whether to close cycles
+        mst: (scipy.sparse.csr_matrix) undirected graph among the points (tree)
+        graph: (scipy.sparse.csr_matrix) fully connected graph
+        points: (N, 3) 3D points that the MST connects in a graph
+        save_dir: pathlib.Path directory where resulting graph is saved as .npz
+        viz_dir: pathlib.Path directory to save mesh (based on vis_mst_mesh)
+        vis_mst_mesh: (boolean) Visualizes the whole MST (can take a while)
+        min_loop_size: (float) The size of a loop (m) above which we will add
+            it intentionally as a cycle
 
-    Returns: TODO
+    Returns: (scipy.sparse.csr_matrix) undirected graph among the points,
+        *potentially* modified to now have cycles (not guaranteed any have been
+        added)
     """
 
     # Convert to a lil matrix, apparently better for elementwise operations
@@ -625,7 +647,6 @@ def close_mst_cycles(
     sparse.save_npz(save_dir.joinpath("cyclic_mst.npz"), cyclic)
 
     if vis_mst_mesh:
-        # This visualizes the whole MST and can take a while
         visualize_as_mesh(points, cyclic, viz_dir, name="cyclic_mst.ply")
 
     return cyclic
@@ -633,12 +654,18 @@ def close_mst_cycles(
 
 def consolidate_lines(save_dir):
     """
-    TODO
+    Takes a directory with many temp*npy arrays and temp*json point indices.
+    vstack the arrays and append the point indices to make one large file
+    of each, and remove the temp files.
 
     Arguments:
-        save_dir: TODO
+        save_dir: pathlib.Path directory where we will consolidate *both* the
+            .npy arrays and .json point indices
 
-    Returns: TODO
+    Returns: Tuple
+        [0] consolidated (N, 8) array of points
+        [1] consolidated list of all point indices (one set of indices per line,
+            a.k.a. per row in the array)
     """
     lines = numpy.vstack(
         [numpy.load(temp) for temp in sorted(save_dir.glob("temp*npy"))]
@@ -657,12 +684,14 @@ def consolidate_lines(save_dir):
 
 def consolidate_vis_lines(save_dir):
     """
-    TODO
+    Opens all temp*ply mesh files and adds them together into one file, removes
+    the temp files.
 
     Arguments:
-        save_dir: TODO
+        save_dir: pathlib.Path directory where we will consolidate the .ply
+            mesh files
 
-    Returns: TODO
+    Output: Saves a consolidated mesh file, returns nothing
     """
     mesh = open3d.geometry.TriangleMesh()
     for temp in save_dir.glob("temp*ply"):
@@ -771,7 +800,8 @@ def get_topography(full, smooth, loop_nodes):
 
     Arguments:
         full: TODO
-        smooth: TODO
+        smooth: (networkx.DiGraph) subset of the full graph where barbs
+            have been removed
         loop_nodes: TODO
 
     Returns:
@@ -981,7 +1011,9 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label, verbose
     TODO
 
     Arguments:
-        topo: TODO
+        topo: (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
         root: TODO
         full_collection: TODO
         viz_dir: TODO
@@ -1131,7 +1163,9 @@ def order_edges(topo, collection, node, seen=None):
     TODO
 
     Arguments:
-        topo: TODO
+        topo: (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
         collection: TODO
         node: TODO
         seen: TODO
@@ -1267,7 +1301,9 @@ def subdivide_graph(topo, root, full_collection, max_optimize_lines=40):
     TODO
 
     Arguments:
-        topo: TODO
+        topo: (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
         root: TODO
         full_collection: TODO
         max_optimize_lines: The max number of lines to optimize together

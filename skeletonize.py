@@ -175,7 +175,7 @@ def calculate_line_components(
 
     line_collection = build_lines(
         split_graphs=split_graphs,
-        topo_graph=topo_graph,
+        topo=topo_graph,
         points=cluster_points,
         cluster_ind=cluster_ind,
     )

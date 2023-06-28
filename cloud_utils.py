@@ -5,15 +5,18 @@ from scipy.spatial import KDTree
 
 def ht_from_points(p1, p2, offset=0.0):
     """
-    TODO
+    Makes an HT between two points. Z axis from p1 to p2, X axis will be as
+    aligned as possible with world X. You can also offset the HT along Z, for
+    example if you offset it by -length/2 then the HT will be at P1.
 
     Arguments:
-        p1: TODO
-        p2: TODO
-        offset: TODO
+        p1: (3,) array, point in 3D space
+        p2: (3,) array, point in 3D space
+        offset: Float, distance to adjust the HT along Z from the default
+            (centered between p1/p2)
 
     Returns:
-        TODO
+        4x4 homogeneous transform
     """
 
     ht = numpy.eye(4)
@@ -32,13 +35,13 @@ def ht_from_points(p1, p2, offset=0.0):
 
 def load_clouds(cloud_paths):
     """
-    TODO
+    Open a series of cloud files and add them all together
 
     Arguments:
-        cloud_paths: TODO
+        cloud_paths: list of pathlib.Path objects pointing to cloud files
 
     Returns:
-        TODO
+        open3d.geometry.PointCloud file, summing the input files
     """
     cloud = open3d.geometry.PointCloud()
     for path in cloud_paths:
@@ -50,17 +53,17 @@ def load_clouds(cloud_paths):
 
 def object_from_pts(p1, p2, color, shape, radius=1e-6):
     """
-    TODO
+    Creates a TriangleMesh object from given points, from p1 to p2.
 
     Arguments:
-        p1: TODO
-        p2: TODO
-        color: TODO
-        shape: TODO
-        radius: TODO
+        p1: (3,) array, point in 3D space
+        p2: (3,) array, point in 3D space
+        color: Can be None or a 3-element tuple/list from 0-1 (RGB)
+        shape: Choice between "cylinder" and "arrow", TriangleMesh builtins
+        radius: Object radius in meters
 
     Returns:
-        TODO
+        open3d.geometry.TriangleMesh object
     """
 
     length = numpy.linalg.norm(p2 - p1)
@@ -92,13 +95,15 @@ def object_from_pts(p1, p2, color, shape, radius=1e-6):
 
 def orthogonal(v, axes):
     """
-    Return v modified to be orthogonal to axes.
+    Return v modified to be orthogonal to all axes. If v is totally aligned
+    with any of the axes, give a random orthogonal vector. Useful for something
+    like Gram-Schmidt.
 
     Arguments:
-        v: TODO
-        axes: TODO
+        v: 3-element vector (should be unit length)
+        axes: list of 3-element vectors (should be unit length)
 
-    Returns: TODO
+    Returns: 3-element vector of length 1, orthogonal to all given axes
     """
     for axis in axes:
         v = v - axis * (axis.dot(v))
@@ -111,14 +116,14 @@ def orthogonal(v, axes):
 
 def smoothing(cloud, radius=0.01):
     """
-    TODO
+    Pulls points closer to a local center
 
     Arguments:
-        cloud: TODO
-        radius: TODO
+        cloud: open3d.geometry.PointCloud object, with or without colors
+        radius: (float) radius of effect in meters
 
-    Returns:
-        TODO
+    Returns: open3d.geometry.PointCloud object where the points have been
+        pulled closer to a local center
     """
     points = numpy.asarray(cloud.points)
     kdtree = open3d.geometry.KDTreeFlann(cloud)
@@ -151,13 +156,14 @@ def smoothing(cloud, radius=0.01):
 
 def sort_for_vis(cloud):
     """
-    TODO
+    Sorts points using a KDTree, the basic idea is for points to be stored in
+    order near nearby points, using the KDTree sorting as a proxy for that
 
     Arguments:
-        cloud: TODO
+        cloud: open3d.geometry.PointCloud object
 
     Returns:
-        TODO
+        open3d.geometry.PointCloud object with the points/color resorted
     """
     points = numpy.asarray(cloud.points)
     colors = numpy.asarray(cloud.colors)
@@ -169,17 +175,17 @@ def sort_for_vis(cloud):
 
 def vis_points(indices, points, color, save_dir, name):
     """
-    TODO
+    Take a set of points and save the chosen indices with a set color as a
+    point cloud
 
     Arguments:
-        indices: TODO
-        points: TODO
-        color: TODO
-        save_dir: TODO
-        name: TODO
+        indices: numpy array of indices in points we want to select
+        points: (N, 3) array of 3D points in space
+        color: 3-element tuple/list from 0-1 (RGB)
+        save_dir: pathlib.Path directory where the cloud is saved
+        name: filename to save the point cloud as
 
-    Returns:
-        TODO
+    Output: Saves a file with the given name to save_dir
     """
     cloud = open3d.geometry.PointCloud(open3d.utility.Vector3dVector(points[indices]))
     cloud.paint_uniform_color(color)
