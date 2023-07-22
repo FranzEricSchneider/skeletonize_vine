@@ -11,6 +11,7 @@ from scipy import sparse
 from scipy.optimize import minimize
 from scipy.sparse import csgraph
 from scipy.spatial import KDTree
+import time
 
 from .cloud_utils import (
     ht_from_points,
@@ -34,14 +35,21 @@ class Line:
         subsample_cutoff=15,
     ):
         """
-        TODO
+        Creates a line object with an associated set of points (downsampled to
+        a certain level if necessary). The endpoints and associated values
+        (length, center, etc) are adjustable but the points are the basis of
+        that.
 
         Arguments:
-            graph: TODO
-            points: TODO
-            indices: TODO
-            topo_edge: TODO
-            original_indices: TODO
+            graph: (networkx.DiGraph) a subset of the full graph between the
+                spanning endpoints
+            points: (N, 3) array of 3D points for the chosen cluster
+            indices: (M,) array of indices, sorted from one end to the other.
+            topo_edge: Two-element list where the elements are either a topo
+                graph index if the line hits one of the endpoints, or None if
+                this is an internal edge.
+            original_indices: (N,) array that tracks the indices of the given
+                points in the original point cloud
             subsample: How much to subsample points for the minimization step
             subsample_cutoff: Below this number of points, don't subsample
         """
@@ -113,13 +121,14 @@ class Line:
 
     def save_ply(self, save_dir, name):
         """
-        TODO
+        Assuming self.final_ends is populated (a.k.a. after optimization),
+        saves the final endpoints as a cylinder.
 
         Arguments:
-            save_dir: TODO
-            name: TODO
+            save_dir: Directory we want save file in.
+            name: (string) Prefix for the file we will save.
 
-        Outputs: TODO
+        Outputs: Writes a green triangle mesh to the save dir.
         """
 
         if self.final_ends is not None:
@@ -138,9 +147,12 @@ class Line:
 
     def init_ply(self):
         """
-        TODO
+        Creates a point cloud and a cylinder representing the current line.
 
-        Returns: TODO
+        Returns: Tuple
+            [0] (open3d PointCloud) captures (potentially downsampled) points
+                associated with this line
+            [1] (open3d TriangleMesh) cylinder based on the line endpoints
         """
 
         cloud = open3d.geometry.PointCloud()
@@ -245,28 +257,41 @@ def lines_to_array(line_collection):
 
 def build_initial_state(line_collection):
     """
-    TODO
+    Build a state array for this specific set of lines. The state is the
+    concatenated 3d location of line endpoints. Where lines share an endpoint,
+    that results in a single state point.
 
     Arguments:
-        line_collection: TODO
+        line_collection: list of Line() objects
 
-    Returns: TODO
+    Returns: (M,) array of concatenated 3d positions (a.k.a. M will be
+        divisible by 3)
     """
 
-    # TODO: ADD COMMENTS
-
+    # The state array we are constructing
     x0 = []
+    # Map of {graph index: slice into the state array} which we use to share
+    # state between lines
     node_slice_map = {}
+
+    # Take sets of lines (which each begin and end at a topo_edge index) and
+    # fill those line indices into the state array
     for chain_idx, lines in enumerate(line_collection):
+
+        # Take the topo edge that we begin the chain of lines with
         l0e0 = lines[0].topo_edge[0]
         assert l0e0 is not None
+        # Check if we've already seen this topo edge
         if l0e0 in node_slice_map:
             lines[0].state_slices[0] = node_slice_map[l0e0]
         else:
+            # If we haven't seen this end yet, add to the state and make a
+            # shared slice in the node map
             x0 += lines[0].ends[0].tolist()
             lines[0].state_slices[0] = slice(len(x0) - 3, len(x0))
             node_slice_map[l0e0] = lines[0].state_slices[0]
 
+        # Do the same thing with the last point in the chain
         lfe1 = lines[-1].topo_edge[1]
         assert lfe1 is not None
         if lfe1 in node_slice_map:
@@ -276,10 +301,13 @@ def build_initial_state(line_collection):
             lines[-1].state_slices[1] = slice(len(x0) - 3, len(x0))
             node_slice_map[lfe1] = lines[-1].state_slices[1]
 
+        # Now add all internal lines to the state structure (will only share
+        # with the adjacent line in the chain)
         for i, (l1, l2) in enumerate(zip(lines[:-1], lines[1:])):
             x0 += ((l1.ends[1] + l2.ends[0]) / 2).tolist()
             l1.state_slices[1] = slice(len(x0) - 3, len(x0))
             l2.state_slices[0] = l1.state_slices[1]
+
     return numpy.array(x0)
 
 
@@ -363,15 +391,19 @@ def build_lines(split_graphs, topo, points, cluster_ind):
 
 def calc_linegraph_meta(graph, points, ends, line_seg_len):
     """
-    TODO
+    Decides how the points in the line graph are ordered, and gives an
+    (initial) split along those sorted indices.
 
     Arguments:
-        graph: TODO
-        points: TODO
-        ends: TODO
-        line_seg_len: TODO
+        graph: (networkx.DiGraph) a subset of the full graph between the
+            spanning endpoints
+        points: (N, 3) array of points for this cluster
+        ends: (3,) tuple of indices representing the start/end of the Digraph
+            topo edge. I believe the third value is for MultiDiGraph indexing
+        line_seg_len: (float) Length along the graph (m) to roughly split into
+            line segments
 
-    Returns: TODO
+    Returns: LineGraph object representing the given subgraph
     """
 
     ###########################################################################
@@ -428,23 +460,35 @@ def calculate_line_components(
 ):
 
     """
-    TODO
+    Ingests an MST and a series of points, then breaks a certain cluster up
+    into line segments. Designed so the clusters can be run in parallel
+    threads.
 
     Arguments:
-        mst: TODO
-        points: TODO
-        labels: TODO
-        label: TODO
-        viz_dir: TODO
-        save_dir: TODO
-        parameters: TODO
-        viz: TODO
-        viz_subgraphs: TODO
-        verbose: TODO
-        ignorable_length: TODO
+        mst: (scipy.sparse.csr_matrix) undirected graph among the points
+        points: (N, 3) array of points that correspond to the MST
+        labels: (N,) array labelling the points with cluster IDs
+        label: (int) the single cluster ID we are examining here (subsamples
+            the points)
+        viz_dir: pathlib.Path where to save certain visualization files
+        save_dir: pathlib.Path where to save final output
+        parameters: (dict) contains certain values needed for line creation
+            ("seg_len", "prior_radius", "prior_weight", "smooth_weight")
+        viz: (bool) Whether to visualize certian large-scale steps like loop
+            closure, smooth graph, etc.
+        viz_subgraphs: Whether to export all subgraphs (based on topology),
+            most useful when debugging the subgraph process (slow)
+        verbose: (bool) Adds series of debug printouts
+        ignorable_length: (float) Length along MST path beneath which discard
+            the cluster (m)
         barb_thresh: Length along MST beneath which we call a branch a barb (m)
 
-    Returns: TODO
+    Outputs: Saves a great many temporary files containing
+        1) .npy arrays containing line endpoints
+        2) .json files with the indices of points corresponding to the lines
+        3) .ply files containing visualized meshes
+    The purpose is that this can be run multi-threaded to create many temporary
+    files, then after its done they can (separately) be consolidated.
     """
 
     cluster_ind = numpy.where(labels == label)[0]
@@ -1002,16 +1046,19 @@ def downstream_cost(graph, node, cutoff=None):
 
 def estimate_line_radii(full_collection, prior, prior_weight, smooth_weight, cap=400):
     """
-    TODO
+    Estimate line radii in a linear solution manner.
 
     Arguments:
-        full_collection: TODO
-        prior: TODO
-        prior_weight: TODO
-        smooth_weight: TODO
-        cap: TODO
+        full_collection: List of lists of Line() objects
+        prior: (float) Size of the prior knowledge on skeleton radius
+        prior_weight: (float) In radius estimation, weight of 'prior' term (1
+            is equal weight to the point fitting component)
+        smooth_weight: (float) In radius estimation, weight of 'smooth' term (1
+            is equal weight to the point fitting component)
+        cap: (int) Max number of lines we will estimate together (computation
+            limit)
 
-    Returns: TODO
+    Returns: Nothing. Each Line() object has its estimate_radius updated.
     """
 
     # Institute a cap on collection size in order to keep lstsq from crashing
@@ -1620,7 +1667,8 @@ def remove_barbs(graph, loop_indices, barb_thresh):
 
 def subdivide_graph(topo, root, full_collection, max_optimize_lines=40):
     """
-    TODO
+    Breaks a full collection up (if deemed necessary) into a series of smaller
+    full collections.
 
     Arguments:
         topo: (networkx.MultiDiGraph) graph where a single edge represents an
@@ -1630,7 +1678,8 @@ def subdivide_graph(topo, root, full_collection, max_optimize_lines=40):
         full_collection: List of lists of Line() objects
         max_optimize_lines: The max number of lines to optimize together
 
-    Returns: TODO
+    Yields: In a generator fashion, each iteration yields a list of lists of
+        Line() objects
     """
 
     num_lines = sum([len(lines) for lines in full_collection])
@@ -1706,20 +1755,25 @@ def visualize_as_mesh(
     shape="cylinder",
 ):
     """
-    TODO
+    Makes a mesh visualization of a given graph, with various color options.
 
     Arguments:
-        points: TODO
-        graph: TODO
-        save_dir: TODO
-        name="graph_vis.ply": TODO
-        color: TODO
-        colormap: TODO
-        random: TODO
-        color_query: TODO
-        shape: TODO
+        points: Set of points that are indexable by the graph indices
+        graph: Graph we want to visualize, can handle (sparse.csr_matrix,
+            networkx.DiGraph)
+        save_dir: pathlib.Path location to save mesh file
+        name: (string) name (must end in .ply) of mesh file we want to save
+        color: (Option 1) None or (3,) array of 0-1 RGB color
+        colormap: (Option 2) dictionary with ("vmin", "vmax", "cmap") defined
+            where the graph weight is sampled relative to min and max on the
+            heatmap for color
+        random: (Option 3) random color for each line
+        color_query: (array) Instead of using the weight of the graph for a
+            given index, instead use the indexed value in this array for a
+            given graph index
+        shape: "arrow" or "cylinder"
 
-    Returns: TODO
+    Outputs: Saved mesh file of the given graph
     """
 
     # Do not visualize multidigraphs
