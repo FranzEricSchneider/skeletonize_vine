@@ -1,4 +1,5 @@
 from collections import Counter, namedtuple
+from itertools import chain, product
 import json
 import matplotlib
 from matplotlib import pyplot
@@ -17,12 +18,20 @@ from .cloud_utils import (
     object_from_pts,
     smoothing,
     sort_for_vis,
+    vis_points,
 )
 
 
 class Line:
     def __init__(
-        self, graph, points, indices, topo_edge, original_indices, subsample=2, subsample_cutoff=15
+        self,
+        graph,
+        points,
+        indices,
+        topo_edge,
+        original_indices,
+        subsample=2,
+        subsample_cutoff=15,
     ):
         """
         TODO
@@ -403,6 +412,193 @@ def calc_linegraph_meta(graph, points, ends, line_seg_len):
     )
 
 
+def calculate_line_components(
+    mst,
+    points,
+    labels,
+    label,
+    viz_dir,
+    save_dir,
+    parameters,
+    viz=False,
+    viz_subgraphs=False,
+    verbose=False,
+    ignorable_length=0.04,
+    barb_thresh=0.04,
+):
+
+    """
+    TODO
+
+    Arguments:
+        mst: TODO
+        points: TODO
+        labels: TODO
+        label: TODO
+        viz_dir: TODO
+        save_dir: TODO
+        parameters: TODO
+        viz: TODO
+        viz_subgraphs: TODO
+        verbose: TODO
+        ignorable_length: TODO
+        barb_thresh: Length along MST beneath which we call a branch a barb (m)
+
+    Returns: TODO
+    """
+
+    cluster_ind = numpy.where(labels == label)[0]
+    cluster_mst = mst[cluster_ind, :][:, cluster_ind]
+    cluster_points = points[cluster_ind]
+
+    if verbose:
+        print(f"Processing label {label} with {len(cluster_ind)} nodes")
+
+    # Choose an arbitrary root at the edge
+    root_i, dist_from_root = choose_a_root(cluster_mst, cluster_points)
+    max_distance = dist_from_root.max()
+    if max_distance < ignorable_length:
+        return
+
+    # Convert the undirected graph to a directed graph from our chosen root
+    directed_graph = mst_to_directed(cluster_mst, dist_from_root)
+
+    # Find the indices in the cluster where a loop has been found in the
+    # directed graph
+    loop_indices = [
+        ind
+        for ind in range(len(cluster_ind))
+        if len([edge for edge in directed_graph.edges if edge[1] == ind]) > 1
+    ]
+    if viz:
+        if len(loop_indices) > 0:
+            vis_points(
+                indices=cluster_ind[loop_indices],
+                points=points,
+                color=(0, 0, 1),
+                save_dir=viz_dir,
+                name="loop_points.ply",
+            )
+
+    # Remove barbed wire nodes who have no downstream weight
+    smooth_graph = remove_barbs(directed_graph, loop_indices, barb_thresh)
+    # If removing barbs leaves an empty graph (probably due to a barb threshold
+    # very near the ignorable length) then just ignore this
+    if len(smooth_graph.nodes) <= 1:
+        return
+
+    if viz:
+        vizkwargs = {
+            "points": cluster_points,
+            "save_dir": viz_dir,
+            "colormap": {"vmax": max_distance, "cmap": "plasma"},
+            "color_query": dist_from_root,
+        }
+        visualize_as_mesh(
+            graph=directed_graph,
+            name=f"label{label}_1_PREdirected_cluster.ply",
+            shape="arrow",
+            **vizkwargs,
+        )
+        visualize_as_mesh(
+            graph=smooth_graph,
+            name=f"label{label}_2_PREsmoothed.ply",
+            shape="arrow",
+            **vizkwargs,
+        )
+
+    # Find the extreme leaves and junction points, and update the full and
+    # smooth graphs based on loops
+    directed_graph, smooth_graph, topo_graph = get_topography(
+        directed_graph, smooth_graph, loop_indices
+    )
+    if viz:
+        vizkwargs = {
+            "points": cluster_points,
+            "save_dir": viz_dir,
+            "colormap": {"vmax": max_distance, "cmap": "plasma"},
+            "color_query": dist_from_root,
+        }
+        visualize_as_mesh(
+            graph=directed_graph,
+            name=f"label{label}_1_directed_cluster.ply",
+            shape="arrow",
+            **vizkwargs,
+        )
+        visualize_as_mesh(
+            graph=smooth_graph,
+            name=f"label{label}_2_smoothed.ply",
+            shape="arrow",
+            **vizkwargs,
+        )
+        visualize_as_mesh(
+            graph=topo_graph,
+            name=f"label{label}_3_topography.ply",
+            shape="arrow",
+            **vizkwargs,
+        )
+    topos = len([_ for _ in networkx.connected_components(topo_graph.to_undirected())])
+    assert topos == 1, f"Topo graph has too many components! ({topos})"
+
+    # Decide where to split up graph points along particular macro branches
+    split_graphs = {}
+    # Make a graph copy that we can remove edges from as we go
+    reduced_smooth_graph = networkx.digraph.DiGraph(smooth_graph)
+    for chain_idx, topo_chain in enumerate(topo_graph.edges):
+
+        line_graph, reduced_smooth_graph = chain_subgraph(
+            full=directed_graph,
+            reduced_smooth=reduced_smooth_graph,
+            topo=topo_graph,
+            span=topo_chain,
+        )
+        if viz and viz_subgraphs:
+            name = f"label{label}_4_{'-'.join(map(str, topo_chain))}_subgraphs.ply"
+            visualize_as_mesh(graph=line_graph, name=name, shape="arrow", **vizkwargs)
+
+        # This does a couple of things, but basically it decides how the points
+        # in this line graph are ordered, and gives an (initial) split along
+        # those sorted indices
+        split_graphs[chain_idx] = calc_linegraph_meta(
+            graph=line_graph,
+            points=cluster_points,
+            ends=topo_chain,
+            line_seg_len=parameters["seg_len"],
+        )
+
+    line_collection = build_lines(
+        split_graphs=split_graphs,
+        topo=topo_graph,
+        points=cluster_points,
+        cluster_ind=cluster_ind,
+    )
+
+    # Run optimization to update the endpoints of the line collection
+    optimize_line_ends(
+        topo=topo_graph,
+        root=root_i,
+        full_collection=line_collection,
+        viz_dir=viz_dir,
+        line_label=label,
+        verbose=verbose,
+    )
+
+    estimate_line_radii(
+        line_collection,
+        prior=parameters["prior_radius"],
+        prior_weight=parameters["prior_weight"],
+        smooth_weight=parameters["smooth_weight"],
+    )
+
+    endpoints, pt_indices = lines_to_array(line_collection)
+    numpy.save(save_dir.joinpath(f"temp_saved_lines_{label}.npy"), endpoints)
+    json.dump(pt_indices, save_dir.joinpath(f"temp_line_idxs_{label}.json").open("w"))
+
+    for i, lines in enumerate(line_collection):
+        for j, line in enumerate(lines):
+            line.save_ply(viz_dir, f"temp_label{label}_edge_{i}_line_{j}")
+
+
 def calculate_mst(graph, dist_graph, save_dir, points, viz_dir, vis_mst_mesh=False):
     """
     Perform MST operation on an arbitrary graph, possibly visualize, but then
@@ -676,8 +872,9 @@ def consolidate_lines(save_dir):
     for temp in sorted(save_dir.glob("temp*json")):
         pt_indices.extend(json.load(temp.open("r")))
     json.dump(pt_indices, save_dir.joinpath(f"graph_line_idxs_used.json").open("w"))
-    for temp in save_dir.glob("temp*"):
-        remove(temp)
+    for search_string in ["temp*npy", "temp*json"]:
+        for temp in save_dir.glob(search_string):
+            remove(temp)
 
     return lines, pt_indices
 
@@ -712,20 +909,28 @@ def construct_graph(
     final_voxel_size,
 ):
     """
-    TODO
+    Takes in a set of cloud files, filters and downsamples the points, then
+    builds a locally connected graph
 
     Arguments:
-        cloud_paths: TODO
-        save_cloud_dir: TODO
-        save_graph_dir: TODO
-        filtering: TODO
-        use_density: TODO
-        final_voxel_size: TODO
+        cloud_paths: List of pathlib.Path objects holding PointCloud data
+        save_cloud_dir: pathlib.Path directory to save the downsampled cloud we
+            base the graph on
+        save_graph_dir: pathlib.Path directory to save the locally connected
+            graphs
+        filtering: List of tuple (filter operations, and kwargs). The filter
+            operations should either be a function of the point cloud, or the
+            smoothing() function from cloud_utils
+        use_density: (boolean) whether to weight the locally connected graph
+            edges by local density
+        final_voxel_size: (float) size in meters to voxel downsample cloud
 
     Returns: Tuple
-        [0]
-        [1] scipy.sparse.csr_matrix for the locally connected graph
-        [2]
+        [0] downsampled cloud we are building the graph from
+        [1] scipy.sparse.csr_matrix for the locally connected graph, where the
+            edge weights may have various interpretations (see density)
+        [2] scipy.sparse.csr_matrix for the locally connected graph, where the
+            edge weights are the 3D distances between points
     """
 
     cloud = load_clouds(cloud_paths)
@@ -771,14 +976,17 @@ def construct_graph(
 
 def downstream_cost(graph, node, cutoff=None):
     """
-    TODO
+    Get the largest downstream path length from a node, up to a cutoff.
 
     Arguments:
-        graph: TODO
-        node: TODO
-        cutoff: TODO
+        graph: (networkx.DiGraph) Graph to search along paths within
+        node: (int) Index of the node we want to search for
+        cutoff: (float) Allow cutting off the path length search at a certain
+            distance for speed reasons (e.g. if the path is above 0.1m we don't
+            care exactly how long it is)
 
-    Returns: TODO
+    Returns: (float) Maximum distance to a downstream node from the given node,
+        capped at cutoff
     """
 
     costs = networkx.single_source_dijkstra_path_length(
@@ -792,19 +1000,115 @@ def downstream_cost(graph, node, cutoff=None):
         return max(costs.values())
 
 
+def estimate_line_radii(full_collection, prior, prior_weight, smooth_weight, cap=400):
+    """
+    TODO
+
+    Arguments:
+        full_collection: TODO
+        prior: TODO
+        prior_weight: TODO
+        smooth_weight: TODO
+        cap: TODO
+
+    Returns: TODO
+    """
+
+    # Institute a cap on collection size in order to keep lstsq from crashing
+    # TODO: Instead of instituting a cap, could we do this with sparse matrices
+    # and least squares on that?
+    for i1, i2 in zip(
+        numpy.arange(0, len(full_collection), cap),
+        numpy.arange(cap, len(full_collection) + cap, cap),
+    ):
+        collection = full_collection[i1:i2]
+
+        def get_lines():
+            return enumerate(chain(*collection))
+
+        num_radii = len([_ for _ in get_lines()])
+        num_points = sum([len(line.full_points) for _, line in get_lines()])
+        a = numpy.zeros((num_points, num_radii))
+        b = numpy.zeros((num_points,))
+
+        # First state that each point should be radius away from the line
+        point_index = 0
+        for radius_index, line in get_lines():
+            distances = line_to_points(
+                v1=line.vector, v2s=line.points - line.final_ends[0]
+            )
+            point_slice = slice(point_index, point_index + len(distances))
+            a[point_slice, radius_index] = 1
+            b[point_slice] = distances
+            # Bookkeeping to index into the matrix correctly
+            point_index += len(distances)
+
+        # Then add the prior sizing
+        prior_scale = prior_weight * (num_points / num_radii)
+        a_prior = numpy.eye(num_radii) * prior_scale
+        b_prior = numpy.ones((num_radii)) * prior * prior_scale
+        a = numpy.vstack([a, a_prior])
+        b = numpy.hstack([b, b_prior])
+
+        # Then state that each line should have the same radius as its
+        # neighbors, scaled by the smoothness factor
+        seen = set()
+        matched = []
+        for i1, l1 in get_lines():
+            for i2, l2 in get_lines():
+                if i1 == i2:
+                    continue
+                key = tuple(sorted((i1, i2)))
+                if key in seen:
+                    continue
+                if any(
+                    [
+                        l1.state_slices[s1] == l2.state_slices[s2]
+                        for s1, s2 in product(range(2), range(2))
+                    ]
+                ):
+                    matched.append(key)
+                seen.add(key)
+        a_smooth = numpy.zeros((len(matched), num_radii))
+        smooth_scale = smooth_weight * (num_points / num_radii)
+        for row, (i1, i2) in enumerate(matched):
+            a_smooth[row, i1] = smooth_scale
+            a_smooth[row, i2] = -smooth_scale
+        b_smooth = numpy.zeros((len(matched),))
+        a = numpy.vstack([a, a_smooth])
+        b = numpy.hstack([b, b_smooth])
+
+        # Finally solve for the least-squares radii
+        radii, residuals, rank, singulars = numpy.linalg.lstsq(a, b, rcond=None)
+
+        # This is the final result, setting a value in each Line value
+        for line, radius in zip(chain(*collection), radii):
+            line.estimated_radius = radius
+
+
 def get_topography(full, smooth, loop_nodes):
     """
     Take a graph and remove all nodes that are not leaves and junctions. This
     leaves you with a graph where each edge represents a subset of the original
-    graph which has no branches and is simply a chain.
+    graph which has no branches and is simply a chain. At loops we reverse part
+    of the loop so that the directed graph all points from one junction to
+    the other.
 
     Arguments:
-        full: TODO
+        full: (networkx.DiGraph) full graph between points that we are
+            processing
         smooth: (networkx.DiGraph) subset of the full graph where barbs
             have been removed
-        loop_nodes: TODO
+        loop_nodes: List of integer node indices where a loop was detected
 
-    Returns:
+    Returns: Tuple
+        [0] (networkx.DiGraph) same as the full input but some of the edge
+            directions have been reverse to match topo edge directions
+        [1] (networkx.DiGraph) same as the smooth input but some of the edge
+            directions have been reverse to match topo edge directions
+        [2] (networkx.MultiDiGraph) graph where a single edge represents an
+            unbranching section of vine. This is a multi-directed graph b/c
+            you could have two graph edges between the same nodes
     """
 
     # Make a copy
@@ -925,8 +1229,9 @@ def mst_to_directed(mst, dist_from_root):
     point back towards the root.
 
     Arguments:
-        mst: TODO
-        dist_from_root: TODO
+        mst: (scipy.sparse.csr_matrix) undirected graph among the points (tree)
+        dist_from_root: (N,) distance of each point from the root, tracing the
+            graph paths
 
     Returns: A networkx directed graph, a copy of MST but pointing away from
         the root
@@ -944,15 +1249,16 @@ def mst_to_directed(mst, dist_from_root):
 
 def num_neighbors(points, cloud, search_radius=0.01):
     """
-    TODO
+    Queries a set of points for the number of neighbors within a radius.
 
     Arguments:
-        points: TODO
-        cloud: TODO
-        search_radius: TODO
+        points: (N, 3) points we want to query for
+        cloud: open3d.geometry.PointCloud object we want to measure our points
+            against
+        search_radius: Radius within which we want to look for neighbors
 
-    Returns:
-        TODO
+    Returns: (N,) array with the number of neighbors for eah queried point
+        (should be >=1 b/c we assume the points are in the cloud)
     """
 
     kdtree = open3d.geometry.KDTreeFlann(cloud)
@@ -968,13 +1274,16 @@ def num_neighbors(points, cloud, search_radius=0.01):
 def objective_function(x, lines):
 
     """
-    TODO
+    Returns a floating point cost for a set of lines (defined by line
+    endpoints) relative to an associated set of 3D points. Error is defined as
+    the sum of squared point-line distances.
 
     Arguments:
-        x: TODO
-        lines: TODO
+        x: State of the system, (N*3,) values for N 3D line endpoints
+        lines: list of Line() objects
 
-    Returns: TODO
+    Returns: (float) sum of squarred error of the points from their associated
+        lines
 
     NOTE: This is a bottleneck in the process.
     """
@@ -1008,19 +1317,23 @@ def objective_function(x, lines):
 
 def optimize_line_ends(topo, root, full_collection, viz_dir, line_label, verbose=False):
     """
-    TODO
+    Sets up the problem and then goes through optimization of line endpoints to
+    pull lines onto the visible points.
 
     Arguments:
         topo: (networkx.MultiDiGraph) graph where a single edge represents an
             unbranching section of vine. This is a multi-directed graph b/c
             you could have two graph edges between the same nodes
-        root: TODO
-        full_collection: TODO
-        viz_dir: TODO
-        line_label: TODO
-        verbose: Add debug printouts
+        root: (int) Index of the root node (arbitrary leaf)
+        full_collection: List of lists of Line() objects
+        viz_dir: pathlib.Path directory to save debug output in IF the
+            optimization fails
+        line_label: (str) gets added to the debug output filename IF the
+            optimization fails
+        verbose: (boolean) Add debug printouts
 
-    Returns: TODO
+    Output: Returns nothing, instead this modifies Line.final_ends for each
+        line in the collection with the post-optimization value
     """
 
     count = 0
@@ -1160,17 +1473,19 @@ def optimize_line_ends(topo, root, full_collection, viz_dir, line_label, verbose
 
 def order_edges(topo, collection, node, seen=None):
     """
-    TODO
+    Create an ordered list of topo edges, starting at the node. This is built
+    up recursively, where we always add the longest downstream path first.
 
     Arguments:
         topo: (networkx.MultiDiGraph) graph where a single edge represents an
             unbranching section of vine. This is a multi-directed graph b/c
             you could have two graph edges between the same nodes
-        collection: TODO
-        node: TODO
-        seen: TODO
+        collection: List of lists of Line() objects
+        node: (int) Index of the node we want to start at
+        seen: Either None or a set containing previously seen topo edges (used
+            for the recursive calls)
 
-    Returns: TODO
+    Returns: Purposely ordered list of (node1, node2) tuples, each a topo edge
     """
 
     if seen is None:
@@ -1220,11 +1535,17 @@ def points_to_graph(points, neighbors, use_density, distance_thresh=0.025):
     Fully connect all points within a tunable radius.
 
     Arguments:
-        points: TODO
-        neighbors: TODO
-        use_density: TODO
+        points: (N, 3) points we want to turn into a locally connected graph
+        neighbors: Number of neighbors for each point (only used when using
+            density)
+        use_density: (boolean) Whether to include a density measure in the
+            graph edge weights
 
-    Returns:
+    Returns: Tuple
+        [0] scipy.sparse.csr_matrix for the locally connected graph, where the
+            edge weights may have various interpretations (see density)
+        [1] scipy.sparse.csr_matrix for the locally connected graph, where the
+            edge weights are the 3D distances between points
     """
     graph = sparse.lil_matrix((points.shape[0], points.shape[0]))
     distance_graph = sparse.lil_matrix((points.shape[0], points.shape[0]))
@@ -1259,11 +1580,12 @@ def remove_barbs(graph, loop_indices, barb_thresh):
     know that the tips of main paths have been clipped back by barb_thresh.
 
     Arguments:
-        graph: TODO
-        loop_indices: TODO
-        barb_thresh: TODO
+        graph: (networkx.DiGraph) MST (directed tree graph)
+        loop_indices: List of integer indices of nodes that form loops (2+)
+            edges leading in
+        barb_thresh: (float) downstream distance below which we clip nodes
 
-    Returns: TODO
+    Returns: (networkx.DiGraph) graph with short spurs dropped
     """
 
     # First make a copy of the graph
@@ -1304,8 +1626,8 @@ def subdivide_graph(topo, root, full_collection, max_optimize_lines=40):
         topo: (networkx.MultiDiGraph) graph where a single edge represents an
             unbranching section of vine. This is a multi-directed graph b/c
             you could have two graph edges between the same nodes
-        root: TODO
-        full_collection: TODO
+        root: (int) Index of the root node (arbitrary leaf)
+        full_collection: List of lists of Line() objects
         max_optimize_lines: The max number of lines to optimize together
 
     Returns: TODO
